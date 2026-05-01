@@ -122,7 +122,7 @@ def main() -> None:
     default_limit = int(os.getenv("DEFAULT_LIMIT", "8"))
     daily_summary_limit = int(os.getenv("DAILY_SUMMARY_LIMIT", "4"))
     daily_push_time = normalize_hhmm(os.getenv("DAILY_PUSH_TIME", "08:30"), "08:30")
-    daily_include_photos = parse_bool(os.getenv("DAILY_INCLUDE_PHOTOS", "false"))
+    daily_include_photos = parse_bool(os.getenv("DAILY_INCLUDE_PHOTOS", "true"))
     live_refresh_seconds = int(os.getenv("LIVE_REFRESH_SECONDS", "300"))
     photo_limit = int(os.getenv("PHOTO_LIMIT", "3"))
 
@@ -495,6 +495,7 @@ def send_daily_summary(
     per_airport_photo_limit = max(1, min(photo_limit, 2))
     for airport in airports:
         send_flight_photos(bot, provider, photo_provider, chat_id, "departures", airport, per_airport_photo_limit)
+        send_flight_photos(bot, provider, photo_provider, chat_id, "arrivals", airport, per_airport_photo_limit)
     return extract_message_id(result), text_hash(text)
 
 

@@ -48,7 +48,7 @@ FLIGHT_PROVIDER=aviationstack
 AVIATIONSTACK_API_KEY=你的_aviationstack_key
 DAILY_PUSH_TIME=08:30
 DAILY_SUMMARY_LIMIT=4
-DAILY_INCLUDE_PHOTOS=false
+DAILY_INCLUDE_PHOTOS=true
 LIVE_REFRESH_SECONDS=300
 AIRCRAFT_ENRICH_PROVIDER=adsbdb
 AIRCRAFT_ENRICH_CACHE_SECONDS=86400
@@ -126,7 +126,7 @@ python3 bot.py
 /photos SHA
 ```
 
-图片输出会发送 1 到 `PHOTO_LIMIT` 张飞机照片，每张图的 caption 包含航班号、航司、注册号、机型、时间、航点和图片来源。
+图片输出会发送 1 到 `PHOTO_LIMIT` 张飞机照片，每张图的 caption 包含航班号、航司、注册号、机型、时间、航点和图片来源。`DAILY_INCLUDE_PHOTOS=true` 时，`/today` 和每日订阅会在文字总览后自动发送浦东/虹桥起飞与到达涂装图片。
 
 ## 交互逻辑
 
@@ -148,6 +148,7 @@ python3 bot.py
 ```text
 用户或群聊发送 /subscribe 08:30
 机器人每天 08:30 自动发送 PVG + SHA 概述
+如果 `DAILY_INCLUDE_PHOTOS=true`，总览后自动发送起飞和到达涂装图片
 发送成功后记录当天日期、message_id 和内容 hash，避免重复发送
 每隔 LIVE_REFRESH_SECONDS 秒检查一次当天日报，如果内容变化就编辑原消息
 用户发送 /unsubscribe 后停止推送
