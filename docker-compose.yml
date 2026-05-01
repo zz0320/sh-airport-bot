@@ -1,0 +1,12 @@
+services:
+  sh-airport-bot:
+    build: .
+    container_name: sh-airport-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+      SUBSCRIPTION_STORE: /app/data/subscriptions.json
+    volumes:
+      - ./data:/app/data

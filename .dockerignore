@@ -1,0 +1,10 @@
+.env
+.git
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+bot.log
+bot.pid
+subscriptions.json
+data/
