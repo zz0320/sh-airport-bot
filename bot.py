@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from flight_provider import AIRPORTS, Flight, FlightProviderError, build_provider, normalize_airport
 from photo_provider import AircraftPhoto, PhotoProviderError, build_photo_provider
-from subscription_store import Subscription, SubscriptionStore, normalize_hhmm
+from subscription_store import FlightWatch, Subscription, SubscriptionStore, normalize_hhmm
 
 
 HELP_TEXT = """✈️ 上海机场起降查询
@@ -34,6 +34,8 @@ HELP_TEXT = """✈️ 上海机场起降查询
 也可以直接发：今日总览、订阅、浦东起飞、虹桥到达、浦东起飞图、PVG、SHA"""
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+AIRPORT_ORDER = ["PVG", "SHA"]
+TIME_PRESETS = ["07:30", "08:30", "12:00", "18:00"]
 
 
 class TelegramBot:
@@ -92,6 +94,9 @@ class TelegramBot:
             params["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
         self._request("sendPhoto", params)
 
+    def send_media_group(self, chat_id: Any, media: list[dict[str, Any]]) -> Any:
+        return self._request("sendMediaGroup", {"chat_id": chat_id, "media": json.dumps(media, ensure_ascii=False)})
+
     def send_chat_action(self, chat_id: Any, action: str) -> None:
         self._request("sendChatAction", {"chat_id": chat_id, "action": action})
 
@@ -124,6 +129,7 @@ def main() -> None:
     daily_push_time = normalize_hhmm(os.getenv("DAILY_PUSH_TIME", "08:30"), "08:30")
     daily_include_photos = parse_bool(os.getenv("DAILY_INCLUDE_PHOTOS", "true"))
     live_refresh_seconds = int(os.getenv("LIVE_REFRESH_SECONDS", "300"))
+    watch_refresh_seconds = int(os.getenv("WATCH_REFRESH_SECONDS", "180"))
     photo_limit = int(os.getenv("PHOTO_LIMIT", "3"))
 
     print("Shanghai flight Telegram bot is running. Press Ctrl+C to stop.", flush=True)
@@ -155,6 +161,7 @@ def main() -> None:
                 photo_limit,
             )
             run_due_daily_refreshes(bot, provider, subscriptions, daily_summary_limit, live_refresh_seconds)
+            run_due_watch_checks(bot, provider, subscriptions, watch_refresh_seconds)
         except KeyboardInterrupt:
             print("\nStopped.", flush=True)
             return
@@ -275,6 +282,22 @@ def dispatch(
         bot.send_message(chat_id, "请选择你要查看的机场信息。", home_keyboard())
         return
 
+    if command in {"realtime", "实时", "实时起降"}:
+        airport = normalize_airport(args)
+        if airport:
+            bot.send_message(chat_id, airport_overview(provider, airport, default_limit), airport_keyboard(airport))
+        else:
+            bot.send_message(chat_id, "选择机场查看实时起降。", realtime_keyboard())
+        return
+
+    if command in {"liveries", "livery", "涂装图片", "涂装相册"}:
+        airport = normalize_airport(args)
+        if airport or args.strip().upper() == "ALL":
+            send_livery_album(bot, provider, photo_provider, chat_id, [airport] if airport else AIRPORT_ORDER, photo_limit)
+        else:
+            bot.send_message(chat_id, "选择机场查看涂装相册。", livery_keyboard())
+        return
+
     if command == "refresh":
         refresh_target(
             bot,
@@ -285,6 +308,18 @@ def dispatch(
             default_limit,
             source_message_id,
         )
+        return
+
+    if command == "detail":
+        show_flight_detail(bot, provider, photo_provider, chat_id, args, default_limit)
+        return
+
+    if command == "watch":
+        watch_flight(bot, provider, subscriptions, chat_id, args, default_limit)
+        return
+
+    if command == "unwatch":
+        unwatch_flight(bot, subscriptions, chat_id, args)
         return
 
     if command in {"today", "daily", "overview", "日报", "今日", "今日总览", "总览"}:
@@ -303,8 +338,8 @@ def dispatch(
 
     if command in {"subscribe", "订阅", "订阅日报", "日报订阅", "每日推送"}:
         push_time = normalize_hhmm(args, daily_push_time)
-        subscription = subscriptions.subscribe(chat_id, push_time, ["PVG", "SHA"])
-        bot.send_message(chat_id, render_subscription(subscription), subscription_keyboard())
+        subscription = subscriptions.subscribe(chat_id, push_time, ["PVG", "SHA"], daily_include_photos, photo_limit)
+        bot.send_message(chat_id, render_subscription(subscription), subscription_keyboard(subscription))
         return
 
     if command in {"unsubscribe", "退订", "取消订阅", "取消日报", "取消推送"}:
@@ -314,9 +349,12 @@ def dispatch(
         return
 
     if command in {"settings", "设置"}:
+        if args:
+            update_subscription_settings(bot, subscriptions, chat_id, args, daily_push_time)
+            return
         subscription = subscriptions.get(chat_id)
         if subscription:
-            bot.send_message(chat_id, render_subscription(subscription), subscription_keyboard())
+            bot.send_message(chat_id, render_subscription(subscription), subscription_keyboard(subscription))
         else:
             bot.send_message(chat_id, "当前聊天未订阅每日推送。", home_keyboard())
         return
@@ -328,12 +366,12 @@ def dispatch(
 
     if command in {"dep", "departures", "起飞", "出发"}:
         airport = normalize_airport(args) or "PVG"
-        bot.send_message(chat_id, render_flights(provider, "departures", airport, default_limit), airport_keyboard(airport))
+        send_flight_list(bot, provider, chat_id, "departures", airport, default_limit)
         return
 
     if command in {"arr", "arrivals", "到达", "抵达", "降落"}:
         airport = normalize_airport(args) or "PVG"
-        bot.send_message(chat_id, render_flights(provider, "arrivals", airport, default_limit), airport_keyboard(airport))
+        send_flight_list(bot, provider, chat_id, "arrivals", airport, default_limit)
         return
 
     if command in {"photo", "photos", "图", "图片", "涂装"}:
@@ -357,7 +395,7 @@ def dispatch(
         elif direction == "arrival_photos":
             send_flight_photos(bot, provider, photo_provider, chat_id, "arrivals", airport, photo_limit)
         else:
-            bot.send_message(chat_id, render_flights(provider, direction, airport, default_limit), airport_keyboard(airport))
+            send_flight_list(bot, provider, chat_id, direction, airport, default_limit)
         return
 
     bot.send_message(chat_id, HELP_TEXT, home_keyboard())
@@ -428,6 +466,87 @@ def safe_get(getter: Any, airport: str, limit: int) -> list[Flight]:
         raise RuntimeError(str(exc)) from exc
 
 
+def send_flight_list(bot: TelegramBot, provider: Any, chat_id: Any, direction: str, airport: str, limit: int) -> None:
+    title = "起飞" if direction == "departures" else "到达"
+    getter = provider.departures if direction == "departures" else provider.arrivals
+    flights = safe_get(getter, airport, limit)
+    text = f"<b>{escape(AIRPORTS[airport])}机场 {airport} {title}</b>\n\n{render_section(title, flights, direction)}"
+    bot.send_message(chat_id, text, flight_list_keyboard(airport, direction, flights))
+
+
+def show_flight_detail(
+    bot: TelegramBot,
+    provider: Any,
+    photo_provider: Any,
+    chat_id: Any,
+    args: str,
+    limit: int,
+) -> None:
+    parsed = parse_flight_ref(args)
+    if not parsed:
+        bot.send_message(chat_id, "没有识别到航班。", home_keyboard())
+        return
+    direction, airport, index = parsed
+    flight = get_indexed_flight(provider, direction, airport, index, limit)
+    if not flight:
+        bot.send_message(chat_id, "这条航班已经不在当前列表里了，请刷新后再试。", airport_keyboard(airport))
+        return
+
+    bot.send_message(chat_id, render_flight_detail(flight, direction), flight_detail_keyboard(airport, direction, index, flight))
+
+
+def watch_flight(bot: TelegramBot, provider: Any, subscriptions: SubscriptionStore, chat_id: Any, args: str, limit: int) -> None:
+    parsed = parse_flight_ref(args)
+    if not parsed:
+        bot.send_message(chat_id, "没有识别到要关注的航班。", home_keyboard())
+        return
+    direction, airport, index = parsed
+    flight = get_indexed_flight(provider, direction, airport, index, limit)
+    if not flight:
+        bot.send_message(chat_id, "这条航班已经不在当前列表里了，请刷新后再试。", airport_keyboard(airport))
+        return
+    subscriptions.add_watch(chat_id, airport, direction, flight.flight_no, flight_state_hash(flight))
+    bot.send_message(
+        chat_id,
+        f"已关注 <b>{escape(flight.flight_no)}</b>。状态、时间、登机口、跑道或注册号变化时会提醒你。",
+        flight_detail_keyboard(airport, direction, index, flight),
+    )
+
+
+def unwatch_flight(bot: TelegramBot, subscriptions: SubscriptionStore, chat_id: Any, args: str) -> None:
+    parts = args.split(":")
+    if len(parts) < 3:
+        bot.send_message(chat_id, "没有识别到要取消关注的航班。", home_keyboard())
+        return
+    direction, airport, flight_no = parts[0], parts[1], parts[2]
+    removed = subscriptions.remove_watch(chat_id, airport, direction, flight_no)
+    text = f"已取消关注 {escape(flight_no)}。" if removed else f"{escape(flight_no)} 当前没有被关注。"
+    bot.send_message(chat_id, text, airport_keyboard(airport if airport in AIRPORTS else "PVG"))
+
+
+def get_indexed_flight(provider: Any, direction: str, airport: str, index: int, limit: int) -> Optional[Flight]:
+    if airport not in AIRPORTS or direction not in {"departures", "arrivals"}:
+        return None
+    getter = provider.departures if direction == "departures" else provider.arrivals
+    flights = safe_get(getter, airport, max(limit, index + 1))
+    return flights[index] if 0 <= index < len(flights) else None
+
+
+def parse_flight_ref(args: str) -> Optional[tuple[str, str, int]]:
+    parts = args.split(":")
+    if len(parts) < 3:
+        return None
+    direction = parts[0]
+    airport = parts[1].upper()
+    try:
+        index = int(parts[2])
+    except ValueError:
+        return None
+    if direction not in {"departures", "arrivals"} or airport not in AIRPORTS:
+        return None
+    return direction, airport, index
+
+
 def run_due_daily_pushes(
     bot: TelegramBot,
     provider: Any,
@@ -448,8 +567,8 @@ def run_due_daily_pushes(
                 subscription.chat_id,
                 subscription.airports,
                 summary_limit,
-                include_photos,
-                photo_limit,
+                subscription.include_photos,
+                subscription.photo_limit,
             )
         except Exception as exc:
             print(f"Daily push failed for {subscription.chat_id}: {exc}", file=sys.stderr, flush=True)
@@ -478,6 +597,40 @@ def run_due_daily_refreshes(
             print(f"Daily refresh failed for {subscription.chat_id}: {exc}", file=sys.stderr, flush=True)
 
 
+def run_due_watch_checks(
+    bot: TelegramBot,
+    provider: Any,
+    subscriptions: SubscriptionStore,
+    refresh_seconds: int,
+) -> None:
+    now = datetime.now(SHANGHAI_TZ)
+    for watch in subscriptions.watches_due(now, refresh_seconds):
+        try:
+            flight = find_watched_flight(provider, watch)
+            if not flight:
+                subscriptions.mark_watch_checked(watch, watch.last_hash)
+                continue
+            next_hash = flight_state_hash(flight)
+            if next_hash != watch.last_hash:
+                title = "起飞" if watch.direction == "departures" else "到达"
+                bot.send_message(
+                    watch.chat_id,
+                    f"<b>{escape(watch.flight_no)} 状态更新</b>\n\n{render_flight(flight, watch.direction)}",
+                    flight_watch_keyboard(watch.airport, watch.direction, watch.flight_no),
+                )
+            subscriptions.mark_watch_checked(watch, next_hash)
+        except Exception as exc:
+            print(f"Watch check failed for {watch.flight_no}: {exc}", file=sys.stderr, flush=True)
+
+
+def find_watched_flight(provider: Any, watch: FlightWatch) -> Optional[Flight]:
+    getter = provider.departures if watch.direction == "departures" else provider.arrivals
+    for flight in safe_get(getter, watch.airport, 20):
+        if flight.flight_no == watch.flight_no:
+            return flight
+    return None
+
+
 def send_daily_summary(
     bot: TelegramBot,
     provider: Any,
@@ -492,10 +645,8 @@ def send_daily_summary(
     result = bot.send_message(chat_id, text, home_keyboard())
     if not include_photos:
         return extract_message_id(result), text_hash(text)
-    per_airport_photo_limit = max(1, min(photo_limit, 2))
     for airport in airports:
-        send_flight_photos(bot, provider, photo_provider, chat_id, "departures", airport, per_airport_photo_limit)
-        send_flight_photos(bot, provider, photo_provider, chat_id, "arrivals", airport, per_airport_photo_limit)
+        send_livery_album(bot, provider, photo_provider, chat_id, [airport], photo_limit)
     return extract_message_id(result), text_hash(text)
 
 
@@ -549,6 +700,31 @@ def render_flight(flight: Flight, direction: str) -> str:
     )
 
 
+def render_flight_detail(flight: Flight, direction: str) -> str:
+    direction_text = "起飞" if direction == "departures" else "到达"
+    airport_label = "目的地" if direction == "departures" else "出发地"
+    lines = [
+        f"<b>{escape(flight.flight_no)} 航班详情</b>",
+        f"航司：{escape(flight.airline)}",
+        f"机型/注册号：{escape(aircraft_text(flight))}",
+        f"方向：{direction_text}",
+        f"起飞：{escape(best_departure_time(flight))}",
+        f"到达：{escape(best_arrival_time(flight))}",
+        f"状态：{escape(flight.status)}",
+        f"{airport_label}：{escape(flight.airport_name)} {escape(flight.airport_iata)}",
+    ]
+    if flight.terminal != "-" or flight.gate != "-":
+        lines.append(f"航站楼/登机口：{escape(flight.terminal)} / {escape(flight.gate)}")
+    if flight.delay_minutes:
+        lines.append(f"延误：{escape(flight.delay_minutes)} 分钟")
+    if flight.departure_runway != "-" or flight.arrival_runway != "-":
+        lines.append(f"跑道：{escape(format_runways_text(flight))}")
+    if flight.aircraft_hex != "-":
+        lines.append(f"Mode-S：{escape(flight.aircraft_hex)}")
+    lines.append(f"涂装：{livery_link(flight)}")
+    return "\n".join(lines)
+
+
 def send_flight_photos(
     bot: TelegramBot,
     provider: Any,
@@ -559,47 +735,106 @@ def send_flight_photos(
     limit: int,
 ) -> None:
     title = "起飞" if direction == "departures" else "到达"
-    getter = provider.departures if direction == "departures" else provider.arrivals
-    flights = safe_get(getter, airport, max(limit * 2, limit))
-    if not flights:
+    items = collect_flight_photos(provider, photo_provider, airport, direction, limit)
+    if not items:
         bot.send_message(chat_id, f"{AIRPORTS[airport]}机场暂时没有查到{title}航班。", airport_keyboard(airport))
         return
 
     bot.send_chat_action(chat_id, "upload_photo")
-    sent = 0
-    skipped: list[str] = []
+    send_photo_items(bot, chat_id, items, airport_keyboard(airport))
+
+
+def send_livery_album(
+    bot: TelegramBot,
+    provider: Any,
+    photo_provider: Any,
+    chat_id: Any,
+    airports: list[str],
+    limit: int,
+) -> None:
+    items: list[tuple[Flight, str, AircraftPhoto]] = []
+    for airport in airports:
+        items.extend(collect_flight_photos(provider, photo_provider, airport, "departures", limit))
+        items.extend(collect_flight_photos(provider, photo_provider, airport, "arrivals", limit))
+    if not items:
+        bot.send_message(chat_id, "暂时没有找到可用涂装图片。", home_keyboard())
+        return
+    bot.send_chat_action(chat_id, "upload_photo")
+    send_photo_items(bot, chat_id, dedupe_photo_items(items)[: max(1, min(limit * max(len(airports), 1), 10))], home_keyboard())
+
+
+def collect_flight_photos(
+    provider: Any,
+    photo_provider: Any,
+    airport: str,
+    direction: str,
+    limit: int,
+) -> list[tuple[Flight, str, AircraftPhoto]]:
+    getter = provider.departures if direction == "departures" else provider.arrivals
+    flights = safe_get(getter, airport, max(limit * 3, limit))
+    items: list[tuple[Flight, str, AircraftPhoto]] = []
     for flight in flights:
-        if sent >= limit:
+        if len(items) >= limit:
             break
-        if flight.aircraft_photo_url != "-":
-            photo = AircraftPhoto(
-                image_url=flight.aircraft_photo_url,
-                thumbnail_url=flight.aircraft_photo_thumbnail_url,
-                photographer=flight.aircraft_photo_source,
-                source_url=flight.aircraft_photo_url,
-                aircraft_registration=flight.aircraft_registration,
-                aircraft_type=flight.aircraft_type,
-            )
-            bot.send_photo(chat_id, photo.image_url, render_photo_caption(flight, direction, photo), airport_keyboard(airport))
-            sent += 1
-            continue
+        photo = photo_for_flight(photo_provider, flight)
+        if photo:
+            items.append((flight, direction, photo))
+    return items
 
-        if flight.aircraft_registration == "-" and flight.aircraft_hex == "-":
-            skipped.append(flight.flight_no)
-            continue
-        try:
-            photo = photo_provider.find_for_aircraft(flight.aircraft_registration, flight.aircraft_hex)
-        except PhotoProviderError as exc:
-            raise RuntimeError(str(exc)) from exc
-        if not photo:
-            skipped.append(f"{flight.flight_no}/{aircraft_text(flight)}")
-            continue
-        bot.send_photo(chat_id, photo.image_url, render_photo_caption(flight, direction, photo), airport_keyboard(airport))
-        sent += 1
 
-    if sent == 0:
-        suffix = f"\n未命中：{escape(', '.join(skipped[:6]))}" if skipped else ""
-        bot.send_message(chat_id, f"这批{title}航班没有找到可用涂装图片。{suffix}", airport_keyboard(airport))
+def photo_for_flight(photo_provider: Any, flight: Flight) -> Optional[AircraftPhoto]:
+    if flight.aircraft_photo_url != "-":
+        return AircraftPhoto(
+            image_url=flight.aircraft_photo_url,
+            thumbnail_url=flight.aircraft_photo_thumbnail_url,
+            photographer=flight.aircraft_photo_source,
+            source_url=flight.aircraft_photo_url,
+            aircraft_registration=flight.aircraft_registration,
+            aircraft_type=flight.aircraft_type,
+        )
+    if flight.aircraft_registration == "-" and flight.aircraft_hex == "-":
+        return None
+    try:
+        return photo_provider.find_for_aircraft(flight.aircraft_registration, flight.aircraft_hex)
+    except PhotoProviderError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def send_photo_items(
+    bot: TelegramBot,
+    chat_id: Any,
+    items: list[tuple[Flight, str, AircraftPhoto]],
+    reply_markup: Optional[dict[str, Any]],
+) -> None:
+    if len(items) == 1:
+        flight, direction, photo = items[0]
+        bot.send_photo(chat_id, photo.image_url, render_photo_caption(flight, direction, photo), reply_markup)
+        return
+    media = []
+    for flight, direction, photo in items[:10]:
+        media.append(
+            {
+                "type": "photo",
+                "media": photo.image_url,
+                "caption": render_photo_caption(flight, direction, photo)[:1024],
+                "parse_mode": "HTML",
+            }
+        )
+    bot.send_media_group(chat_id, media)
+    if reply_markup:
+        bot.send_message(chat_id, "涂装相册已发送。", reply_markup)
+
+
+def dedupe_photo_items(items: list[tuple[Flight, str, AircraftPhoto]]) -> list[tuple[Flight, str, AircraftPhoto]]:
+    seen = set()
+    result = []
+    for item in items:
+        url = item[2].image_url
+        if url in seen:
+            continue
+        seen.add(url)
+        result.append(item)
+    return result
 
 
 def render_photo_caption(flight: Flight, direction: str, photo: Any) -> str:
@@ -656,12 +891,17 @@ def best_time(actual: str, estimated: str, scheduled: str) -> str:
 
 
 def format_runways(flight: Flight) -> str:
+    text = format_runways_text(flight)
+    return f"\n  跑道：{escape(text)}" if text else ""
+
+
+def format_runways_text(flight: Flight) -> str:
     parts = []
     if flight.departure_runway != "-":
         parts.append(f"起飞跑道 {flight.departure_runway}")
     if flight.arrival_runway != "-":
         parts.append(f"到达跑道 {flight.arrival_runway}")
-    return f"\n  跑道：{escape(' / '.join(parts))}" if parts else ""
+    return " / ".join(parts)
 
 
 def livery_link(flight: Flight) -> str:
@@ -675,14 +915,69 @@ def livery_link(flight: Flight) -> str:
     return f'<a href="https://www.planespotters.net/photos/reg/{registration}">图库</a>'
 
 
+def flight_state_hash(flight: Flight) -> str:
+    payload = "|".join(
+        [
+            flight.flight_no,
+            flight.status,
+            flight.departure_scheduled,
+            flight.departure_estimated,
+            flight.departure_actual,
+            flight.arrival_scheduled,
+            flight.arrival_estimated,
+            flight.arrival_actual,
+            flight.terminal,
+            flight.gate,
+            str(flight.delay_minutes),
+            flight.aircraft_registration,
+            flight.aircraft_type,
+            flight.departure_runway,
+            flight.arrival_runway,
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def render_subscription(subscription: Subscription) -> str:
     airports = "、".join(f"{AIRPORTS[airport]} {airport}" for airport in subscription.airports)
+    include_photos = "开启" if subscription.include_photos else "关闭"
     return (
         "<b>每日推送已开启</b>\n"
         f"时间：{escape(subscription.push_time)} Asia/Shanghai\n"
         f"机场：{escape(airports)}\n"
-        "内容：航班号、航司、机型、注册号、涂装图库、起飞/到达时间、跑道（如数据源提供）"
+        f"涂装图片：{include_photos}，每次最多 {subscription.photo_limit} 张\n"
+        "内容：航班号、航司、机型、注册号、涂装图片、起飞/到达时间、跑道（如数据源提供）"
     )
+
+
+def update_subscription_settings(
+    bot: TelegramBot,
+    subscriptions: SubscriptionStore,
+    chat_id: Any,
+    args: str,
+    default_push_time: str,
+) -> None:
+    subscription = subscriptions.ensure(chat_id, default_push_time)
+    parts = args.split(":")
+    action = parts[0] if parts else ""
+    updated: Optional[Subscription] = subscription
+
+    if action == "time" and len(parts) >= 2:
+        updated = subscriptions.update_push_time(chat_id, normalize_hhmm(":".join(parts[1:]), subscription.push_time))
+    elif action == "photos" and len(parts) >= 2:
+        updated = subscriptions.update_include_photos(chat_id, parts[1] == "on")
+    elif action == "limit" and len(parts) >= 2:
+        try:
+            updated = subscriptions.update_photo_limit(chat_id, int(parts[1]))
+        except ValueError:
+            updated = subscription
+    elif action == "airports" and len(parts) >= 2:
+        updated = subscriptions.update_airports(chat_id, parse_airports(parts[1]) or ["PVG", "SHA"])
+    else:
+        bot.send_message(chat_id, render_subscription(subscription), subscription_keyboard(subscription))
+        return
+
+    bot.send_message(chat_id, render_subscription(updated or subscription), subscription_keyboard(updated or subscription))
 
 
 def refresh_target(
@@ -746,15 +1041,41 @@ def home_keyboard() -> dict[str, Any]:
         "inline_keyboard": [
             [
                 {"text": "今日总览", "callback_data": "today"},
-                {"text": "刷新", "callback_data": "refresh:today"},
+                {"text": "实时起降", "callback_data": "realtime"},
             ],
             [
-                {"text": "订阅日报", "callback_data": "subscribe"},
+                {"text": "涂装图片", "callback_data": "liveries"},
                 {"text": "订阅设置", "callback_data": "settings"},
             ],
+        ]
+    }
+
+
+def realtime_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
             [
                 {"text": "浦东 PVG", "callback_data": "pvg"},
                 {"text": "虹桥 SHA", "callback_data": "sha"},
+            ],
+            [
+                {"text": "全部机场总览", "callback_data": "today"},
+                {"text": "菜单", "callback_data": "menu"},
+            ],
+        ]
+    }
+
+
+def livery_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "浦东涂装", "callback_data": "liveries:PVG"},
+                {"text": "虹桥涂装", "callback_data": "liveries:SHA"},
+            ],
+            [
+                {"text": "全部涂装", "callback_data": "liveries:ALL"},
+                {"text": "菜单", "callback_data": "menu"},
             ],
         ]
     }
@@ -778,18 +1099,81 @@ def airport_keyboard(airport: str) -> dict[str, Any]:
             ],
             [
                 {"text": "今日总览", "callback_data": "today"},
-                {"text": "订阅日报", "callback_data": "subscribe"},
+                {"text": "菜单", "callback_data": "menu"},
             ],
         ]
     }
 
 
-def subscription_keyboard() -> dict[str, Any]:
+def flight_list_keyboard(airport: str, direction: str, flights: list[Flight]) -> dict[str, Any]:
+    rows = []
+    for index, flight in enumerate(flights[:6]):
+        rows.append(
+            [
+                {"text": f"{flight.flight_no} 详情", "callback_data": f"detail:{direction}:{airport}:{index}"},
+                {"text": "图片", "callback_data": f"photos:{direction}:{airport}"},
+                {"text": "关注", "callback_data": f"watch:{direction}:{airport}:{index}"},
+            ]
+        )
+    rows.extend(airport_keyboard(airport)["inline_keyboard"])
+    return {"inline_keyboard": rows}
+
+
+def flight_detail_keyboard(airport: str, direction: str, index: int, flight: Flight) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "涂装图片", "callback_data": f"photos:{direction}:{airport}"},
+                {"text": "关注航班", "callback_data": f"watch:{direction}:{airport}:{index}"},
+            ],
+            [
+                {"text": "返回列表", "callback_data": f"{direction}:{airport}"},
+                {"text": "取消关注", "callback_data": f"unwatch:{direction}:{airport}:{flight.flight_no}"},
+            ],
+            [
+                {"text": "菜单", "callback_data": "menu"},
+            ],
+        ]
+    }
+
+
+def flight_watch_keyboard(airport: str, direction: str, flight_no: str) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "查看机场", "callback_data": airport.lower()},
+                {"text": "取消关注", "callback_data": f"unwatch:{direction}:{airport}:{flight_no}"},
+            ]
+        ]
+    }
+
+
+def subscription_keyboard(subscription: Optional[Subscription] = None) -> dict[str, Any]:
+    photo_enabled = subscription.include_photos if subscription else True
     return {
         "inline_keyboard": [
             [
                 {"text": "立即看今日总览", "callback_data": "today"},
                 {"text": "取消订阅", "callback_data": "unsubscribe"},
+            ],
+            [
+                {"text": "07:30", "callback_data": "settings:time:07:30"},
+                {"text": "08:30", "callback_data": "settings:time:08:30"},
+                {"text": "12:00", "callback_data": "settings:time:12:00"},
+                {"text": "18:00", "callback_data": "settings:time:18:00"},
+            ],
+            [
+                {
+                    "text": "关闭图片" if photo_enabled else "开启图片",
+                    "callback_data": f"settings:photos:{'off' if photo_enabled else 'on'}",
+                },
+                {"text": "图片3张", "callback_data": "settings:limit:3"},
+                {"text": "图片6张", "callback_data": "settings:limit:6"},
+            ],
+            [
+                {"text": "PVG+SHA", "callback_data": "settings:airports:PVG,SHA"},
+                {"text": "仅PVG", "callback_data": "settings:airports:PVG"},
+                {"text": "仅SHA", "callback_data": "settings:airports:SHA"},
             ],
             [
                 {"text": "菜单", "callback_data": "menu"},

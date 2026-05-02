@@ -8,6 +8,8 @@
 - `/subscribe 08:30` 订阅每日定时推送，时间使用 Asia/Shanghai
 - `/unsubscribe` 取消每日推送
 - `/settings` 查看订阅状态
+- 主菜单入口：今日总览、实时起降、涂装图片、订阅设置
+- 航班列表支持详情、涂装图片和关注航班
 - `/pvg` 查看浦东机场起飞和到达概览
 - `/sha` 查看虹桥机场起飞和到达概览
 - `/departures PVG` 查询指定机场起飞
@@ -50,6 +52,7 @@ DAILY_PUSH_TIME=08:30
 DAILY_SUMMARY_LIMIT=4
 DAILY_INCLUDE_PHOTOS=true
 LIVE_REFRESH_SECONDS=300
+WATCH_REFRESH_SECONDS=180
 AIRCRAFT_ENRICH_PROVIDER=adsbdb
 AIRCRAFT_ENRICH_CACHE_SECONDS=86400
 PHOTO_PROVIDER=auto
@@ -128,19 +131,22 @@ python3 bot.py
 
 图片输出会发送 1 到 `PHOTO_LIMIT` 张飞机照片，每张图的 caption 包含航班号、航司、注册号、机型、时间、航点和图片来源。`DAILY_INCLUDE_PHOTOS=true` 时，`/today` 和每日订阅会在文字总览后自动发送浦东/虹桥起飞与到达涂装图片。
 
+多张图片会合并为 Telegram 相册发送，减少刷屏。
+
 ## 交互逻辑
 
 推荐主路径：
 
 ```text
 /start
-按钮：今日总览 / 订阅日报 / 浦东 PVG / 虹桥 SHA
+按钮：今日总览 / 实时起降 / 涂装图片 / 订阅设置
 ```
 
 机场详情页：
 
 ```text
-起飞 / 到达 / 起飞图 / 到达图 / 今日总览 / 订阅日报
+起飞 / 到达 / 刷新 / 起飞图 / 到达图 / 今日总览
+航班列表里可点：详情 / 图片 / 关注
 ```
 
 每日推送：
@@ -153,6 +159,23 @@ python3 bot.py
 每隔 LIVE_REFRESH_SECONDS 秒检查一次当天日报，如果内容变化就编辑原消息
 用户发送 /unsubscribe 后停止推送
 ```
+
+关注航班：
+
+```text
+进入起飞或到达列表
+点击某条航班的“关注”
+机器人每隔 WATCH_REFRESH_SECONDS 秒检查一次
+状态、时间、登机口、跑道或注册号变化时提醒
+```
+
+头像：
+
+```text
+assets/sh-airport-bot-avatar.png
+```
+
+可以在 BotFather 里使用 `/setuserpic` 上传。
 
 订阅信息默认写入 `subscriptions.json`，这个文件已在 `.gitignore` 中忽略。
 
