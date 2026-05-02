@@ -1,5 +1,7 @@
 .env
 subscriptions.json
+flight_memory.json
+data/
 bot.log
 bot.pid
 __pycache__/

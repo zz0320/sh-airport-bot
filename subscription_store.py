@@ -14,6 +14,7 @@ class Subscription:
     airports: list[str]
     include_photos: bool
     photo_limit: int
+    daily_mode: str
     last_sent_date: str
     last_message_id: Optional[int]
     last_message_hash: str
@@ -42,6 +43,7 @@ class SubscriptionStore:
         airports: list[str],
         include_photos: bool = True,
         photo_limit: int = 3,
+        daily_mode: str = "spotter",
     ) -> Subscription:
         existing = self._data["chats"].get(str(chat_id), {})
         subscription = {
@@ -50,6 +52,7 @@ class SubscriptionStore:
             "airports": airports,
             "include_photos": include_photos,
             "photo_limit": photo_limit,
+            "daily_mode": normalize_daily_mode(daily_mode or existing.get("daily_mode", "spotter")),
             "last_sent_date": existing.get("last_sent_date", ""),
             "last_message_id": existing.get("last_message_id"),
             "last_message_hash": existing.get("last_message_hash", ""),
@@ -68,11 +71,11 @@ class SubscriptionStore:
         raw = self._data["chats"].get(str(chat_id))
         return self._to_subscription(raw) if raw else None
 
-    def ensure(self, chat_id: Any, default_push_time: str = "08:30") -> Subscription:
+    def ensure(self, chat_id: Any, default_push_time: str = "08:30", default_daily_mode: str = "spotter") -> Subscription:
         subscription = self.get(chat_id)
         if subscription:
             return subscription
-        return self.subscribe(chat_id, default_push_time, ["PVG", "SHA"])
+        return self.subscribe(chat_id, default_push_time, ["PVG", "SHA"], daily_mode=default_daily_mode)
 
     def update_push_time(self, chat_id: Any, push_time: str) -> Optional[Subscription]:
         raw = self._data["chats"].get(str(chat_id))
@@ -106,6 +109,15 @@ class SubscriptionStore:
         if not raw:
             return None
         raw["photo_limit"] = min(max(photo_limit, 1), 6)
+        raw["last_sent_date"] = ""
+        self._save()
+        return self._to_subscription(raw)
+
+    def update_daily_mode(self, chat_id: Any, daily_mode: str) -> Optional[Subscription]:
+        raw = self._data["chats"].get(str(chat_id))
+        if not raw:
+            return None
+        raw["daily_mode"] = normalize_daily_mode(daily_mode)
         raw["last_sent_date"] = ""
         self._save()
         return self._to_subscription(raw)
@@ -227,6 +239,7 @@ class SubscriptionStore:
             airports=[airport for airport in airports if airport in {"PVG", "SHA"}] or ["PVG", "SHA"],
             include_photos=stored_bool(raw.get("include_photos", True)),
             photo_limit=min(max(int(raw.get("photo_limit", 3)), 1), 6),
+            daily_mode=normalize_daily_mode(raw.get("daily_mode", "spotter")),
             last_sent_date=raw.get("last_sent_date", ""),
             last_message_id=raw.get("last_message_id"),
             last_message_hash=raw.get("last_message_hash", ""),
@@ -271,3 +284,10 @@ def stored_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return bool(value)
+
+
+def normalize_daily_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in {"brief", "spotter", "full"}:
+        return mode
+    return "spotter"

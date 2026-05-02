@@ -4,6 +4,7 @@ import html
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -13,8 +14,9 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from flight_provider import AIRPORTS, Flight, FlightProviderError, build_provider, normalize_airport
+from flight_memory import FlightChange, FlightMemory
 from photo_provider import AircraftPhoto, PhotoProviderError, build_photo_provider
-from subscription_store import FlightWatch, Subscription, SubscriptionStore, normalize_hhmm
+from subscription_store import FlightWatch, Subscription, SubscriptionStore, normalize_daily_mode, normalize_hhmm
 
 
 HELP_TEXT = """✈️ 上海机场起降查询
@@ -30,12 +32,48 @@ HELP_TEXT = """✈️ 上海机场起降查询
 /departures PVG - 查询起飞
 /arrivals SHA - 查询到达
 /photos PVG - 获取近期航班涂装图片
+/spotting - 今日值得看的飞机
+/changes - 最近航班信息变化
+/detail MU5101 - 按航班号查询详情
+/watch MU5101 - 关注航班变化
 
-也可以直接发：今日总览、订阅、浦东起飞、虹桥到达、浦东起飞图、PVG、SHA"""
+也可以直接发：今日总览、今日看点、最近变化、订阅、浦东起飞、虹桥到达、浦东起飞图、MU5101、关注 MU5101、PVG、SHA"""
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 AIRPORT_ORDER = ["PVG", "SHA"]
 TIME_PRESETS = ["07:30", "08:30", "12:00", "18:00"]
+DAILY_MODE_LABELS = {"brief": "精简", "spotter": "飞友", "full": "完整"}
+FLIGHT_NO_RE = re.compile(r"\b([A-Z0-9]{2,3})\s?(\d{2,5}[A-Z]?)\b", re.IGNORECASE)
+WIDEBODY_TYPES = {
+    "A300",
+    "A310",
+    "A330",
+    "A332",
+    "A333",
+    "A338",
+    "A339",
+    "A340",
+    "A343",
+    "A345",
+    "A346",
+    "A350",
+    "A359",
+    "A35K",
+    "A380",
+    "A388",
+    "B747",
+    "B748",
+    "B763",
+    "B764",
+    "B772",
+    "B773",
+    "B77L",
+    "B77W",
+    "B787",
+    "B788",
+    "B789",
+    "B78X",
+}
 
 
 class TelegramBot:
@@ -126,10 +164,12 @@ def main() -> None:
     provider = build_provider()
     photo_provider = build_photo_provider()
     subscriptions = SubscriptionStore(os.getenv("SUBSCRIPTION_STORE", "subscriptions.json"))
+    memory = FlightMemory(os.getenv("FLIGHT_MEMORY_STORE", "flight_memory.json"))
     default_limit = int(os.getenv("DEFAULT_LIMIT", "8"))
     daily_summary_limit = int(os.getenv("DAILY_SUMMARY_LIMIT", "4"))
     daily_push_time = normalize_hhmm(os.getenv("DAILY_PUSH_TIME", "08:30"), "08:30")
     daily_include_photos = parse_bool(os.getenv("DAILY_INCLUDE_PHOTOS", "true"))
+    default_daily_mode = normalize_daily_mode(os.getenv("DEFAULT_DAILY_MODE", "spotter"))
     live_refresh_seconds = int(os.getenv("LIVE_REFRESH_SECONDS", "300"))
     watch_refresh_seconds = int(os.getenv("WATCH_REFRESH_SECONDS", "180"))
     photo_limit = int(os.getenv("PHOTO_LIMIT", "3"))
@@ -146,11 +186,13 @@ def main() -> None:
                     provider,
                     photo_provider,
                     subscriptions,
+                    memory,
                     update,
                     default_limit,
                     daily_summary_limit,
                     daily_push_time,
                     daily_include_photos,
+                    default_daily_mode,
                     photo_limit,
                 )
             run_due_daily_pushes(
@@ -158,11 +200,13 @@ def main() -> None:
                 provider,
                 photo_provider,
                 subscriptions,
+                memory,
                 daily_summary_limit,
                 daily_include_photos,
+                default_daily_mode,
                 photo_limit,
             )
-            run_due_daily_refreshes(bot, provider, subscriptions, daily_summary_limit, live_refresh_seconds)
+            run_due_daily_refreshes(bot, provider, subscriptions, memory, daily_summary_limit, live_refresh_seconds)
             run_due_watch_checks(bot, provider, subscriptions, watch_refresh_seconds)
         except KeyboardInterrupt:
             print("\nStopped.", flush=True)
@@ -177,11 +221,13 @@ def handle_update(
     provider: Any,
     photo_provider: Any,
     subscriptions: SubscriptionStore,
+    memory: FlightMemory,
     update: dict[str, Any],
     default_limit: int,
     daily_summary_limit: int,
     daily_push_time: str,
     daily_include_photos: bool,
+    default_daily_mode: str,
     photo_limit: int,
 ) -> None:
     if "callback_query" in update:
@@ -196,12 +242,14 @@ def handle_update(
                 provider,
                 photo_provider,
                 subscriptions,
+                memory,
                 chat_id,
                 callback.get("data", ""),
                 default_limit,
                 daily_summary_limit,
                 daily_push_time,
                 daily_include_photos,
+                default_daily_mode,
                 photo_limit,
                 message_id,
             )
@@ -216,12 +264,14 @@ def handle_update(
             provider,
             photo_provider,
             subscriptions,
+            memory,
             chat_id,
             text,
             default_limit,
             daily_summary_limit,
             daily_push_time,
             daily_include_photos,
+            default_daily_mode,
             photo_limit,
             None,
         )
@@ -232,12 +282,14 @@ def safe_dispatch(
     provider: Any,
     photo_provider: Any,
     subscriptions: SubscriptionStore,
+    memory: FlightMemory,
     chat_id: Any,
     text: str,
     default_limit: int,
     daily_summary_limit: int,
     daily_push_time: str,
     daily_include_photos: bool,
+    default_daily_mode: str,
     photo_limit: int,
     source_message_id: Optional[int],
 ) -> None:
@@ -247,12 +299,14 @@ def safe_dispatch(
             provider,
             photo_provider,
             subscriptions,
+            memory,
             chat_id,
             text,
             default_limit,
             daily_summary_limit,
             daily_push_time,
             daily_include_photos,
+            default_daily_mode,
             photo_limit,
             source_message_id,
         )
@@ -265,12 +319,14 @@ def dispatch(
     provider: Any,
     photo_provider: Any,
     subscriptions: SubscriptionStore,
+    memory: FlightMemory,
     chat_id: Any,
     text: str,
     default_limit: int,
     daily_summary_limit: int,
     daily_push_time: str,
     daily_include_photos: bool,
+    default_daily_mode: str,
     photo_limit: int,
     source_message_id: Optional[int],
 ) -> None:
@@ -284,6 +340,15 @@ def dispatch(
         bot.send_message(chat_id, "请选择你要查看的机场信息。", home_keyboard())
         return
 
+    watch_request = parse_watch_text(text)
+    if watch_request:
+        watch_flight_number(bot, provider, subscriptions, chat_id, watch_request, default_limit)
+        return
+
+    if is_bare_flight_query(text):
+        show_flight_number_result(bot, provider, photo_provider, chat_id, flight_number_from_text(text) or text, default_limit)
+        return
+
     if command in {"realtime", "实时", "实时起降"}:
         airport = normalize_airport(args)
         if airport:
@@ -295,15 +360,35 @@ def dispatch(
     if command in {"liveries", "livery", "涂装图片", "涂装相册"}:
         airport = normalize_airport(args)
         if airport or args.strip().upper() == "ALL":
-            send_livery_album(bot, provider, photo_provider, chat_id, [airport] if airport else AIRPORT_ORDER, photo_limit)
+            send_livery_album(
+                bot,
+                provider,
+                photo_provider,
+                memory,
+                chat_id,
+                [airport] if airport else AIRPORT_ORDER,
+                photo_limit,
+            )
         else:
             bot.send_message(chat_id, "选择机场查看涂装相册。", livery_keyboard())
+        return
+
+    if command in {"spotting", "spot", "看点", "今日看点", "今日值得看", "飞友看点"}:
+        airports = parse_airports(args) or AIRPORT_ORDER
+        bot.send_message(chat_id, render_spotting(provider, memory, airports, max(default_limit, daily_summary_limit)), home_keyboard())
+        update_memory_for_airports(provider, memory, airports, max(default_limit, daily_summary_limit))
+        return
+
+    if command in {"changes", "change", "变化", "最近变化", "动态"}:
+        airports = parse_airports(args) or AIRPORT_ORDER
+        bot.send_message(chat_id, render_changes(provider, memory, airports, max(default_limit, daily_summary_limit)), home_keyboard())
         return
 
     if command == "refresh":
         refresh_target(
             bot,
             provider,
+            memory,
             chat_id,
             args or "today",
             daily_summary_limit,
@@ -313,11 +398,19 @@ def dispatch(
         return
 
     if command == "detail":
-        show_flight_detail(bot, provider, photo_provider, chat_id, args, default_limit)
+        if flight_number_from_text(args):
+            show_flight_number_result(bot, provider, photo_provider, chat_id, args, default_limit)
+        else:
+            show_flight_detail(bot, provider, photo_provider, chat_id, args, default_limit)
         return
 
     if command == "watch":
-        watch_flight(bot, provider, subscriptions, chat_id, args, default_limit)
+        if parse_flight_ref(args):
+            watch_flight(bot, provider, subscriptions, chat_id, args, default_limit)
+        elif flight_number_from_text(args):
+            watch_flight_number(bot, provider, subscriptions, chat_id, args, default_limit)
+        else:
+            watch_flight(bot, provider, subscriptions, chat_id, args, default_limit)
         return
 
     if command == "unwatch":
@@ -334,13 +427,22 @@ def dispatch(
             airports,
             daily_summary_limit,
             daily_include_photos,
+            default_daily_mode,
             photo_limit,
+            memory,
         )
         return
 
     if command in {"subscribe", "订阅", "订阅日报", "日报订阅", "每日推送"}:
         push_time = normalize_hhmm(args, daily_push_time)
-        subscription = subscriptions.subscribe(chat_id, push_time, ["PVG", "SHA"], daily_include_photos, photo_limit)
+        subscription = subscriptions.subscribe(
+            chat_id,
+            push_time,
+            AIRPORT_ORDER,
+            daily_include_photos,
+            photo_limit,
+            default_daily_mode,
+        )
         bot.send_message(chat_id, render_subscription(subscription), subscription_keyboard(subscription))
         return
 
@@ -352,13 +454,17 @@ def dispatch(
 
     if command in {"settings", "设置"}:
         if args:
-            update_subscription_settings(bot, subscriptions, chat_id, args, daily_push_time)
+            update_subscription_settings(bot, subscriptions, chat_id, args, daily_push_time, default_daily_mode)
             return
         subscription = subscriptions.get(chat_id)
         if subscription:
             bot.send_message(chat_id, render_subscription(subscription), subscription_keyboard(subscription))
         else:
             bot.send_message(chat_id, "当前聊天未订阅每日推送。", home_keyboard())
+        return
+
+    if command in {"flight", "航班", "查询", "查"} and flight_number_from_text(args or text):
+        show_flight_number_result(bot, provider, photo_provider, chat_id, args or text, default_limit)
         return
 
     if command in {"pvg", "sha"}:
@@ -378,13 +484,13 @@ def dispatch(
 
     if command in {"photo", "photos", "图", "图片", "涂装"}:
         airport = normalize_airport(args) or "PVG"
-        send_flight_photos(bot, provider, photo_provider, chat_id, "departures", airport, photo_limit)
+        send_flight_photos(bot, provider, photo_provider, memory, chat_id, "departures", airport, photo_limit)
         return
 
     if command in {"photos:departures", "photos:arrivals"}:
         direction = command.split(":", 1)[1]
         airport = normalize_airport(args) or "PVG"
-        send_flight_photos(bot, provider, photo_provider, chat_id, direction, airport, photo_limit)
+        send_flight_photos(bot, provider, photo_provider, memory, chat_id, direction, airport, photo_limit)
         return
 
     inferred = infer_query(text)
@@ -393,11 +499,15 @@ def dispatch(
         if direction == "overview":
             bot.send_message(chat_id, airport_overview(provider, airport, default_limit), airport_keyboard(airport))
         elif direction == "departure_photos":
-            send_flight_photos(bot, provider, photo_provider, chat_id, "departures", airport, photo_limit)
+            send_flight_photos(bot, provider, photo_provider, memory, chat_id, "departures", airport, photo_limit)
         elif direction == "arrival_photos":
-            send_flight_photos(bot, provider, photo_provider, chat_id, "arrivals", airport, photo_limit)
+            send_flight_photos(bot, provider, photo_provider, memory, chat_id, "arrivals", airport, photo_limit)
         else:
             send_flight_list(bot, provider, chat_id, direction, airport, default_limit)
+        return
+
+    if flight_number_from_text(text):
+        show_flight_number_result(bot, provider, photo_provider, chat_id, text, default_limit)
         return
 
     bot.send_message(chat_id, HELP_TEXT, home_keyboard())
@@ -439,6 +549,27 @@ def infer_query(text: str) -> Optional[tuple[str, str]]:
     if wants_photo:
         return ("departure_photos", airport)
     return ("overview", airport)
+
+
+def parse_watch_text(text: str) -> Optional[str]:
+    stripped = text.strip()
+    lowered = stripped.lower()
+    if lowered.startswith(("/watch ", "watch ", "track ", "follow ")) or stripped.startswith(("关注", "追踪")):
+        return flight_number_from_text(stripped)
+    return None
+
+
+def is_bare_flight_query(text: str) -> bool:
+    flight_no = flight_number_from_text(text)
+    return bool(flight_no and text.strip().replace(" ", "").upper() == flight_no)
+
+
+def flight_number_from_text(text: str) -> Optional[str]:
+    for match in FLIGHT_NO_RE.finditer(text or ""):
+        prefix = match.group(1)
+        if any(char.isalpha() for char in prefix):
+            return f"{prefix}{match.group(2)}".upper()
+    return None
 
 
 def airport_overview(provider: Any, airport: str, limit: int) -> str:
@@ -549,13 +680,101 @@ def parse_flight_ref(args: str) -> Optional[tuple[str, str, int]]:
     return direction, airport, index
 
 
+def show_flight_number_result(
+    bot: TelegramBot,
+    provider: Any,
+    photo_provider: Any,
+    chat_id: Any,
+    text: str,
+    limit: int,
+) -> None:
+    flight_no = flight_number_from_text(text)
+    if not flight_no:
+        bot.send_message(chat_id, "没有识别到航班号。", home_keyboard())
+        return
+    candidates = find_flight_candidates(provider, flight_no, limit)
+    if not candidates:
+        bot.send_message(chat_id, f"暂时没有在 PVG/SHA 今日起降里找到 {escape(flight_no)}。", home_keyboard())
+        return
+    if len(candidates) > 1:
+        bot.send_message(chat_id, render_flight_candidates(flight_no, candidates), home_keyboard())
+        return
+
+    airport, direction, index, flight = candidates[0]
+    try:
+        photo = photo_for_flight(photo_provider, flight)
+    except RuntimeError:
+        photo = None
+    keyboard = flight_detail_keyboard(airport, direction, index, flight)
+    if photo:
+        bot.send_chat_action(chat_id, "upload_photo")
+        bot.send_photo(chat_id, photo.image_url, render_photo_caption(flight, direction, photo), keyboard)
+        return
+    bot.send_message(chat_id, render_flight_detail(flight, direction), keyboard)
+
+
+def watch_flight_number(
+    bot: TelegramBot,
+    provider: Any,
+    subscriptions: SubscriptionStore,
+    chat_id: Any,
+    text: str,
+    limit: int,
+) -> None:
+    flight_no = flight_number_from_text(text)
+    if not flight_no:
+        bot.send_message(chat_id, "没有识别到要关注的航班号。", home_keyboard())
+        return
+    candidates = find_flight_candidates(provider, flight_no, limit)
+    if not candidates:
+        bot.send_message(chat_id, f"暂时没有在 PVG/SHA 今日起降里找到 {escape(flight_no)}，可以稍后再试。", home_keyboard())
+        return
+    airport, direction, index, flight = candidates[0]
+    subscriptions.add_watch(chat_id, airport, direction, flight.flight_no, flight_state_hash(flight))
+    bot.send_message(
+        chat_id,
+        f"已关注 <b>{escape(flight.flight_no)}</b>。状态、时间、登机口、跑道或注册号变化时会提醒你。",
+        flight_detail_keyboard(airport, direction, index, flight),
+    )
+
+
+def find_flight_candidates(
+    provider: Any,
+    flight_no: str,
+    limit: int,
+) -> list[tuple[str, str, int, Flight]]:
+    normalized = flight_no.replace(" ", "").upper()
+    candidates = []
+    for airport in AIRPORT_ORDER:
+        for direction in ("departures", "arrivals"):
+            getter = provider.departures if direction == "departures" else provider.arrivals
+            for index, flight in enumerate(safe_get(getter, airport, max(limit, 12))):
+                if flight.flight_no.replace(" ", "").upper() == normalized:
+                    candidates.append((airport, direction, index, flight))
+    return candidates
+
+
+def render_flight_candidates(flight_no: str, candidates: list[tuple[str, str, int, Flight]]) -> str:
+    lines = [f"<b>{escape(flight_no)} 找到多条记录</b>"]
+    for airport, direction, index, flight in candidates:
+        direction_text = "起飞" if direction == "departures" else "到达"
+        lines.append(
+            f"• {escape(AIRPORTS[airport])} {escape(airport)} {direction_text} #{index + 1}\n"
+            f"  {escape(aircraft_text(flight))} · {escape(best_departure_time(flight))} / {escape(best_arrival_time(flight))}"
+        )
+    lines.append("可以从机场列表点详情，或发送“关注 航班号”追踪变化。")
+    return "\n".join(lines)
+
+
 def run_due_daily_pushes(
     bot: TelegramBot,
     provider: Any,
     photo_provider: Any,
     subscriptions: SubscriptionStore,
+    memory: FlightMemory,
     summary_limit: int,
     include_photos: bool,
+    default_daily_mode: str,
     photo_limit: int,
 ) -> None:
     now = datetime.now(SHANGHAI_TZ)
@@ -570,7 +789,9 @@ def run_due_daily_pushes(
                 subscription.airports,
                 summary_limit,
                 subscription.include_photos,
+                subscription.daily_mode or default_daily_mode,
                 subscription.photo_limit,
+                memory,
             )
         except Exception as exc:
             print(f"Daily push failed for {subscription.chat_id}: {exc}", file=sys.stderr, flush=True)
@@ -582,6 +803,7 @@ def run_due_daily_refreshes(
     bot: TelegramBot,
     provider: Any,
     subscriptions: SubscriptionStore,
+    memory: FlightMemory,
     summary_limit: int,
     refresh_seconds: int,
 ) -> None:
@@ -590,10 +812,11 @@ def run_due_daily_refreshes(
     now = datetime.now(SHANGHAI_TZ)
     for subscription in subscriptions.refresh_due(now, refresh_seconds):
         try:
-            text = render_daily_summary(provider, subscription.airports, summary_limit)
+            text = render_daily_summary(provider, subscription.airports, summary_limit, subscription.daily_mode, memory)
             message_hash = text_hash(text)
             if message_hash != subscription.last_message_hash and subscription.last_message_id:
                 bot.edit_message_text(subscription.chat_id, subscription.last_message_id, text, home_keyboard())
+                update_memory_for_airports(provider, memory, subscription.airports, summary_limit)
             subscriptions.mark_refreshed(subscription.chat_id, message_hash)
         except Exception as exc:
             print(f"Daily refresh failed for {subscription.chat_id}: {exc}", file=sys.stderr, flush=True)
@@ -641,25 +864,39 @@ def send_daily_summary(
     airports: list[str],
     summary_limit: int,
     include_photos: bool,
+    daily_mode: str,
     photo_limit: int,
+    memory: FlightMemory,
 ) -> tuple[Optional[int], str]:
-    text = render_daily_summary(provider, airports, summary_limit)
+    text = render_daily_summary(provider, airports, summary_limit, daily_mode, memory)
     result = bot.send_message(chat_id, text, home_keyboard())
+    update_memory_for_airports(provider, memory, airports, summary_limit)
     if not include_photos:
         return extract_message_id(result), text_hash(text)
     for airport in airports:
-        send_livery_album(bot, provider, photo_provider, chat_id, [airport], photo_limit)
+        send_livery_album(bot, provider, photo_provider, memory, chat_id, [airport], photo_limit)
     return extract_message_id(result), text_hash(text)
 
 
-def render_daily_summary(provider: Any, airports: list[str], limit: int) -> str:
+def render_daily_summary(
+    provider: Any,
+    airports: list[str],
+    limit: int,
+    daily_mode: str = "spotter",
+    memory: Optional[FlightMemory] = None,
+) -> str:
     generated_at = datetime.now(SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M")
+    mode = normalize_daily_mode(daily_mode)
     sections = [
-        "<b>上海机场每日起降概述</b>",
+        f"<b>上海机场 v2 每日情报</b> · {escape(DAILY_MODE_LABELS[mode])}模式",
         f"生成时间：{escape(generated_at)} Asia/Shanghai",
     ]
+    if mode in {"brief", "spotter"}:
+        sections.append(render_intelligence_digest(provider, memory, airports, limit, mode))
+    if mode == "brief":
+        return "\n\n".join(sections)
     for airport in airports:
-        sections.append(render_airport_daily(provider, airport, limit))
+        sections.append(render_airport_daily(provider, airport, limit if mode == "full" else min(limit, 4)))
     return "\n\n".join(sections)
 
 
@@ -673,6 +910,186 @@ def render_airport_daily(provider: Any, airport: str, limit: int) -> str:
             render_section("到达", arrivals, "arrivals"),
         ]
     )
+
+
+def render_intelligence_digest(
+    provider: Any,
+    memory: Optional[FlightMemory],
+    airports: list[str],
+    limit: int,
+    mode: str,
+) -> str:
+    scored = ranked_flights(provider, memory, airports, max(limit, 8))
+    total_departures = sum(1 for _, _, _, direction, _ in scored if direction == "departures")
+    total_arrivals = sum(1 for _, _, _, direction, _ in scored if direction == "arrivals")
+    delayed = [item for item in scored if item[4].delay_minutes or "延误" in item[4].status or "取消" in item[4].status]
+    top_count = 3 if mode == "brief" else 5
+
+    lines = [
+        "<b>情报摘要</b>",
+        f"覆盖：{escape('、'.join(airports))} · 起飞 {total_departures} 条 · 到达 {total_arrivals} 条",
+    ]
+    if delayed:
+        lines.append(f"异常/延误：{len(delayed)} 条，发送 /changes 可看是否有新变化。")
+    else:
+        lines.append("异常/延误：当前样本内未见明显异常。")
+
+    lines.append("<b>今日值得看</b>")
+    if not scored:
+        lines.append("暂时没有查到可用于判断的航班。")
+        return "\n".join(lines)
+    for index, item in enumerate(scored[:top_count], start=1):
+        lines.append(render_spotting_item(index, item))
+    return "\n".join(lines)
+
+
+def render_spotting(provider: Any, memory: Optional[FlightMemory], airports: list[str], limit: int) -> str:
+    scored = ranked_flights(provider, memory, airports, max(limit, 10))
+    lines = [
+        "<b>今日值得看</b>",
+        "按宽体、注册号、可用照片、跑道/登机口信息、延误异常和新见飞机综合排序。",
+    ]
+    if not scored:
+        lines.append("暂时没有查到可用于判断的航班。")
+        return "\n".join(lines)
+    for index, item in enumerate(scored[:8], start=1):
+        lines.append(render_spotting_item(index, item))
+    lines.append("发送“关注 MU5101”可以追踪某一班的状态变化。")
+    return "\n".join(lines)
+
+
+def render_changes(provider: Any, memory: FlightMemory, airports: list[str], limit: int) -> str:
+    all_changes: list[FlightChange] = []
+    for airport in airports:
+        departures = safe_get(provider.departures, airport, max(limit, 8))
+        arrivals = safe_get(provider.arrivals, airport, max(limit, 8))
+        all_changes.extend(memory.compare(airport, "departures", departures))
+        all_changes.extend(memory.compare(airport, "arrivals", arrivals))
+        memory.update(airport, "departures", departures)
+        memory.update(airport, "arrivals", arrivals)
+
+    if not all_changes:
+        return "\n".join(
+            [
+                "<b>最近变化</b>",
+                "这次没有发现状态、时间、登机口、跑道或注册号变化。",
+                "我已经刷新基线；下一次再点“最近变化”会和这次结果对比。",
+            ]
+        )
+
+    lines = ["<b>最近变化</b>"]
+    for change in all_changes[:10]:
+        direction_text = "起飞" if change.direction == "departures" else "到达"
+        lines.append(
+            f"• <b>{escape(change.flight_no)}</b> {escape(AIRPORTS.get(change.airport, change.airport))} {direction_text}\n"
+            f"  {escape('；'.join(change.changes[:3]))}"
+        )
+    if len(all_changes) > 10:
+        lines.append(f"还有 {len(all_changes) - 10} 条变化未展示。")
+    return "\n".join(lines)
+
+
+def update_memory_for_airports(provider: Any, memory: FlightMemory, airports: list[str], limit: int) -> None:
+    for airport in airports:
+        memory.update(airport, "departures", safe_get(provider.departures, airport, max(limit, 8)))
+        memory.update(airport, "arrivals", safe_get(provider.arrivals, airport, max(limit, 8)))
+
+
+def ranked_flights(
+    provider: Any,
+    memory: Optional[FlightMemory],
+    airports: list[str],
+    limit: int,
+) -> list[tuple[int, list[str], str, str, Flight]]:
+    scored: list[tuple[int, list[str], str, str, Flight]] = []
+    for airport in airports:
+        for direction in ("departures", "arrivals"):
+            getter = provider.departures if direction == "departures" else provider.arrivals
+            for flight in safe_get(getter, airport, max(limit, 8)):
+                score, reasons = flight_priority(flight, memory)
+                scored.append((score, reasons, airport, direction, flight))
+    scored.sort(key=lambda item: (item[0], best_time_for_sort(item[4], item[3])), reverse=True)
+    return scored
+
+
+def flight_priority(flight: Flight, memory: Optional[FlightMemory]) -> tuple[int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+    if flight.aircraft_photo_url != "-":
+        score += 5
+        reasons.append("有图")
+    if flight.aircraft_registration != "-":
+        score += 2
+        reasons.append(flight.aircraft_registration)
+        if memory and not memory.seen_registration(flight.aircraft_registration):
+            score += 4
+            reasons.append("新见")
+    if is_widebody(flight):
+        score += 4
+        reasons.append("宽体")
+    if flight.delay_minutes:
+        score += 3
+        reasons.append(f"延误{flight.delay_minutes}m")
+    if "取消" in flight.status or "延误" in flight.status or "改道" in flight.status:
+        score += 4
+        reasons.append("状态异常")
+    if format_runways_text(flight):
+        score += 2
+        reasons.append("有跑道")
+    if flight.gate != "-":
+        score += 1
+    if is_non_base_airline(flight.airline):
+        score += 1
+        reasons.append("少见航司")
+    if not reasons:
+        reasons.append("时刻靠前")
+    return score, dedupe_text(reasons)[:4]
+
+
+def render_spotting_item(index: int, item: tuple[int, list[str], str, str, Flight]) -> str:
+    _, reasons, airport, direction, flight = item
+    direction_text = "起飞" if direction == "departures" else "到达"
+    opposite_label = "去" if direction == "departures" else "从"
+    route = f"{airport} {opposite_label} {airport_endpoint_text(flight)}"
+    time_text = best_departure_time(flight) if direction == "departures" else best_arrival_time(flight)
+    return (
+        f"{index}. <b>{escape(flight.flight_no)}</b> {escape(flight.airline)}\n"
+        f"   {escape(AIRPORTS[airport])} {direction_text} · {escape(route)}\n"
+        f"   {escape(aircraft_text(flight))} · {escape(time_text)} · 看点：{escape('、'.join(reasons))}"
+    )
+
+
+def airport_endpoint_text(flight: Flight) -> str:
+    if flight.airport_iata not in {"-", "---"}:
+        return f"{flight.airport_name} {flight.airport_iata}"
+    return flight.airport_name
+
+
+def is_widebody(flight: Flight) -> bool:
+    aircraft_type = flight.aircraft_type.replace("-", "").replace(" ", "").upper()
+    return aircraft_type in WIDEBODY_TYPES or any(aircraft_type.startswith(prefix) for prefix in ("A33", "A34", "A35", "A38", "B77", "B78", "B74", "B76"))
+
+
+def is_non_base_airline(airline: str) -> bool:
+    base_names = ("东方", "上海航空", "中国国际", "南方", "春秋", "吉祥", "中国货运", "顺丰", "邮政")
+    return airline != "-" and not any(name in airline for name in base_names)
+
+
+def best_time_for_sort(flight: Flight, direction: str) -> str:
+    if direction == "departures":
+        return best_departure_time(flight)
+    return best_arrival_time(flight)
+
+
+def dedupe_text(values: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def render_section(title: str, flights: list[Flight], direction: str) -> str:
@@ -731,13 +1148,14 @@ def send_flight_photos(
     bot: TelegramBot,
     provider: Any,
     photo_provider: Any,
+    memory: Optional[FlightMemory],
     chat_id: Any,
     direction: str,
     airport: str,
     limit: int,
 ) -> None:
     title = "起飞" if direction == "departures" else "到达"
-    items = collect_flight_photos(provider, photo_provider, airport, direction, limit)
+    items = collect_flight_photos(provider, photo_provider, memory, airport, direction, limit)
     if not items:
         bot.send_message(chat_id, f"{AIRPORTS[airport]}机场暂时没有查到{title}航班。", airport_keyboard(airport))
         return
@@ -750,14 +1168,15 @@ def send_livery_album(
     bot: TelegramBot,
     provider: Any,
     photo_provider: Any,
+    memory: Optional[FlightMemory],
     chat_id: Any,
     airports: list[str],
     limit: int,
 ) -> None:
     items: list[tuple[Flight, str, AircraftPhoto]] = []
     for airport in airports:
-        items.extend(collect_flight_photos(provider, photo_provider, airport, "departures", limit))
-        items.extend(collect_flight_photos(provider, photo_provider, airport, "arrivals", limit))
+        items.extend(collect_flight_photos(provider, photo_provider, memory, airport, "departures", limit))
+        items.extend(collect_flight_photos(provider, photo_provider, memory, airport, "arrivals", limit))
     if not items:
         bot.send_message(chat_id, "暂时没有找到可用涂装图片。", home_keyboard())
         return
@@ -768,17 +1187,22 @@ def send_livery_album(
 def collect_flight_photos(
     provider: Any,
     photo_provider: Any,
+    memory: Optional[FlightMemory],
     airport: str,
     direction: str,
     limit: int,
 ) -> list[tuple[Flight, str, AircraftPhoto]]:
     getter = provider.departures if direction == "departures" else provider.arrivals
     flights = safe_get(getter, airport, max(limit * 3, limit))
+    flights = sorted(flights, key=lambda flight: flight_priority(flight, memory)[0], reverse=True)
     items: list[tuple[Flight, str, AircraftPhoto]] = []
     for flight in flights:
         if len(items) >= limit:
             break
-        photo = photo_for_flight(photo_provider, flight)
+        try:
+            photo = photo_for_flight(photo_provider, flight)
+        except RuntimeError:
+            continue
         if photo:
             items.append((flight, direction, photo))
     return items
@@ -943,10 +1367,12 @@ def flight_state_hash(flight: Flight) -> str:
 def render_subscription(subscription: Subscription) -> str:
     airports = "、".join(f"{AIRPORTS[airport]} {airport}" for airport in subscription.airports)
     include_photos = "开启" if subscription.include_photos else "关闭"
+    daily_mode = DAILY_MODE_LABELS.get(subscription.daily_mode, DAILY_MODE_LABELS["spotter"])
     return (
         "<b>每日推送已开启</b>\n"
         f"时间：{escape(subscription.push_time)} Asia/Shanghai\n"
         f"机场：{escape(airports)}\n"
+        f"模式：{escape(daily_mode)}\n"
         f"涂装图片：{include_photos}，每次最多 {subscription.photo_limit} 张\n"
         "内容：航班号、航司、机型、注册号、涂装图片、起飞/到达时间、跑道（如数据源提供）"
     )
@@ -958,8 +1384,9 @@ def update_subscription_settings(
     chat_id: Any,
     args: str,
     default_push_time: str,
+    default_daily_mode: str,
 ) -> None:
-    subscription = subscriptions.ensure(chat_id, default_push_time)
+    subscription = subscriptions.ensure(chat_id, default_push_time, default_daily_mode)
     parts = args.split(":")
     action = parts[0] if parts else ""
     updated: Optional[Subscription] = subscription
@@ -975,6 +1402,8 @@ def update_subscription_settings(
             updated = subscription
     elif action == "airports" and len(parts) >= 2:
         updated = subscriptions.update_airports(chat_id, parse_airports(parts[1]) or ["PVG", "SHA"])
+    elif action == "mode" and len(parts) >= 2:
+        updated = subscriptions.update_daily_mode(chat_id, normalize_daily_mode(parts[1] or default_daily_mode))
     else:
         bot.send_message(chat_id, render_subscription(subscription), subscription_keyboard(subscription))
         return
@@ -985,6 +1414,7 @@ def update_subscription_settings(
 def refresh_target(
     bot: TelegramBot,
     provider: Any,
+    memory: FlightMemory,
     chat_id: Any,
     target: str,
     daily_summary_limit: int,
@@ -993,7 +1423,13 @@ def refresh_target(
 ) -> None:
     normalized = target.strip().lower()
     if normalized in {"", "today", "daily", "all", "总览"}:
-        text = render_daily_summary(provider, ["PVG", "SHA"], daily_summary_limit)
+        text = render_daily_summary(provider, ["PVG", "SHA"], daily_summary_limit, "spotter", memory)
+        keyboard = home_keyboard()
+    elif normalized in {"spotting", "spot", "看点"}:
+        text = render_spotting(provider, memory, AIRPORT_ORDER, max(default_limit, daily_summary_limit))
+        keyboard = home_keyboard()
+    elif normalized in {"changes", "change", "变化"}:
+        text = render_changes(provider, memory, AIRPORT_ORDER, max(default_limit, daily_summary_limit))
         keyboard = home_keyboard()
     else:
         airport = normalize_airport(normalized) or normalized.upper()
@@ -1043,10 +1479,14 @@ def home_keyboard() -> dict[str, Any]:
         "inline_keyboard": [
             [
                 {"text": "今日总览", "callback_data": "today"},
-                {"text": "实时起降", "callback_data": "realtime"},
+                {"text": "今日看点", "callback_data": "spotting"},
             ],
             [
+                {"text": "实时起降", "callback_data": "realtime"},
                 {"text": "涂装图片", "callback_data": "liveries"},
+            ],
+            [
+                {"text": "最近变化", "callback_data": "changes"},
                 {"text": "订阅设置", "callback_data": "settings"},
             ],
         ]
@@ -1062,7 +1502,8 @@ def realtime_keyboard() -> dict[str, Any]:
             ],
             [
                 {"text": "全部机场总览", "callback_data": "today"},
-                {"text": "菜单", "callback_data": "menu"},
+                {"text": "今日看点", "callback_data": "spotting"},
+                {"text": "最近变化", "callback_data": "changes"},
             ],
         ]
     }
@@ -1163,6 +1604,11 @@ def subscription_keyboard(subscription: Optional[Subscription] = None) -> dict[s
                 {"text": "08:30", "callback_data": "settings:time:08:30"},
                 {"text": "12:00", "callback_data": "settings:time:12:00"},
                 {"text": "18:00", "callback_data": "settings:time:18:00"},
+            ],
+            [
+                {"text": "精简", "callback_data": "settings:mode:brief"},
+                {"text": "飞友", "callback_data": "settings:mode:spotter"},
+                {"text": "完整", "callback_data": "settings:mode:full"},
             ],
             [
                 {

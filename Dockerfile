@@ -10,7 +10,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-COPY bot.py flight_provider.py photo_provider.py subscription_store.py ./
+COPY bot.py flight_provider.py photo_provider.py subscription_store.py flight_memory.py ./
 
 RUN mkdir -p /app/data
 

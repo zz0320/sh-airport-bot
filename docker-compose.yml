@@ -8,5 +8,6 @@ services:
     environment:
       TZ: Asia/Shanghai
       SUBSCRIPTION_STORE: /app/data/subscriptions.json
+      FLIGHT_MEMORY_STORE: /app/data/flight_memory.json
     volumes:
       - ./data:/app/data

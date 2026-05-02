@@ -4,11 +4,15 @@
 
 ## 功能
 
-- `/today` 立即发送浦东和虹桥机场每日起降概述
+- `/today` 立即发送浦东和虹桥机场 v2 每日情报
+- `/spotting` 查看今日值得看的宽体、少见航司、新见注册号和有图航班
+- `/changes` 对比上次快照，查看状态、时间、登机口、跑道、注册号变化
+- `/detail MU5101` 按航班号查询详情，命中图片时直接返回涂装图
+- `/watch MU5101` 或“关注 MU5101”关注某一班变化
 - `/subscribe 08:30` 订阅每日定时推送，时间使用 Asia/Shanghai
 - `/unsubscribe` 取消每日推送
 - `/settings` 查看订阅状态
-- 主菜单入口：今日总览、实时起降、涂装图片、订阅设置
+- 主菜单入口：今日总览、今日看点、实时起降、涂装图片、最近变化、订阅设置
 - 航班列表支持详情、涂装图片和关注航班
 - `/pvg` 查看浦东机场起飞和到达概览
 - `/sha` 查看虹桥机场起飞和到达概览
@@ -53,6 +57,7 @@ TELEGRAM_HTTP_TIMEOUT_SECONDS=40
 DAILY_PUSH_TIME=08:30
 DAILY_SUMMARY_LIMIT=4
 DAILY_INCLUDE_PHOTOS=true
+DEFAULT_DAILY_MODE=spotter
 LIVE_REFRESH_SECONDS=300
 WATCH_REFRESH_SECONDS=180
 AIRCRAFT_ENRICH_PROVIDER=adsbdb
@@ -61,6 +66,7 @@ PHOTO_PROVIDER=auto
 PHOTO_CACHE_SECONDS=86400
 PHOTO_LIMIT=3
 SUBSCRIPTION_STORE=subscriptions.json
+FLIGHT_MEMORY_STORE=flight_memory.json
 ```
 
 没有 Aviationstack key 时，可以先这样跑通机器人：
@@ -88,6 +94,10 @@ python3 bot.py
 /departures PVG
 /arrivals SHA
 /photos PVG
+/spotting
+/changes
+/detail MU5101
+/watch MU5101
 /help
 ```
 
@@ -101,6 +111,10 @@ python3 bot.py
 浦东起飞图
 虹桥到达照片
 今日总览
+今日看点
+最近变化
+MU5101
+关注 MU5101
 订阅日报
 ```
 
@@ -131,7 +145,7 @@ python3 bot.py
 /photos SHA
 ```
 
-图片输出会发送 1 到 `PHOTO_LIMIT` 张飞机照片，每张图的 caption 包含航班号、航司、注册号、机型、时间、航点和图片来源。`DAILY_INCLUDE_PHOTOS=true` 时，`/today` 和每日订阅会在文字总览后自动发送浦东/虹桥起飞与到达涂装图片。
+图片输出会发送 1 到 `PHOTO_LIMIT` 张飞机照片，每张图的 caption 包含航班号、航司、注册号、机型、时间、航点和图片来源。图片会按“值得看”排序：宽体、有图、新见注册号、少见航司、跑道/登机口信息和异常延误会优先。`DAILY_INCLUDE_PHOTOS=true` 时，`/today` 和每日订阅会在文字总览后自动发送浦东/虹桥起飞与到达涂装图片。
 
 多张图片会合并为 Telegram 相册发送，减少刷屏。
 
@@ -141,7 +155,7 @@ python3 bot.py
 
 ```text
 /start
-按钮：今日总览 / 实时起降 / 涂装图片 / 订阅设置
+按钮：今日总览 / 今日看点 / 实时起降 / 涂装图片 / 最近变化 / 订阅设置
 ```
 
 机场详情页：
@@ -155,7 +169,8 @@ python3 bot.py
 
 ```text
 用户或群聊发送 /subscribe 08:30
-机器人每天 08:30 自动发送 PVG + SHA 概述
+机器人每天 08:30 自动发送 PVG + SHA v2 情报
+可以在 /settings 里切换日报模式：精简 / 飞友 / 完整
 如果 `DAILY_INCLUDE_PHOTOS=true`，总览后自动发送起飞和到达涂装图片
 发送成功后记录当天日期、message_id 和内容 hash，避免重复发送
 每隔 LIVE_REFRESH_SECONDS 秒检查一次当天日报，如果内容变化就编辑原消息
@@ -167,8 +182,18 @@ python3 bot.py
 ```text
 进入起飞或到达列表
 点击某条航班的“关注”
+也可以直接发送：关注 MU5101
 机器人每隔 WATCH_REFRESH_SECONDS 秒检查一次
 状态、时间、登机口、跑道或注册号变化时提醒
+```
+
+v2 记忆：
+
+```text
+/changes 会把这次查询结果和上一次快照对比
+/spotting 会用历史见过的注册号判断“新见飞机”
+记忆默认写入 FLIGHT_MEMORY_STORE
+Docker 部署时建议设为 /app/data/flight_memory.json
 ```
 
 头像：
@@ -179,7 +204,7 @@ assets/sh-airport-bot-avatar.png
 
 可以在 BotFather 里使用 `/setuserpic` 上传。
 
-订阅信息默认写入 `subscriptions.json`，这个文件已在 `.gitignore` 中忽略。
+订阅信息默认写入 `subscriptions.json`，航班变化记忆默认写入 `flight_memory.json`，这两个文件已在 `.gitignore` 中忽略。
 
 刷新逻辑：
 

@@ -39,10 +39,12 @@ TELEGRAM_HTTP_TIMEOUT_SECONDS=15
 
 DAILY_PUSH_TIME=08:30
 DAILY_SUMMARY_LIMIT=4
-DAILY_INCLUDE_PHOTOS=false
+DAILY_INCLUDE_PHOTOS=true
+DEFAULT_DAILY_MODE=spotter
 LIVE_REFRESH_SECONDS=300
 WATCH_REFRESH_SECONDS=180
 SUBSCRIPTION_STORE=/app/data/subscriptions.json
+FLIGHT_MEMORY_STORE=/app/data/flight_memory.json
 
 AIRCRAFT_ENRICH_PROVIDER=adsbdb
 AIRCRAFT_ENRICH_CACHE_SECONDS=86400
@@ -105,6 +107,9 @@ docker compose up -d --build
 ```text
 /start
 /today
+/spotting
+/changes
+关注 MU5101
 浦东起飞图
 /subscribe 08:30
 ```
@@ -117,7 +122,13 @@ docker compose up -d --build
 /volume1/docker/sh-airport-bot/data/subscriptions.json
 ```
 
-这个文件来自 compose 的 volume 映射，容器重建后不会丢。
+v2 的航班变化记忆写入：
+
+```text
+/volume1/docker/sh-airport-bot/data/flight_memory.json
+```
+
+这些文件来自 compose 的 volume 映射，容器重建后不会丢。
 
 ## 注意
 
