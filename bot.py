@@ -39,10 +39,11 @@ TIME_PRESETS = ["07:30", "08:30", "12:00", "18:00"]
 
 
 class TelegramBot:
-    def __init__(self, token: str) -> None:
+    def __init__(self, token: str, http_timeout: int) -> None:
         if not token:
             raise RuntimeError("缺少 TELEGRAM_BOT_TOKEN。")
         self.base_url = f"https://api.telegram.org/bot{token}"
+        self.http_timeout = http_timeout
 
     def get_updates(self, offset: Optional[int], timeout: int) -> list[dict[str, Any]]:
         params: dict[str, Any] = {
@@ -110,7 +111,7 @@ class TelegramBot:
             data=data,
             headers={"User-Agent": "shanghai-flight-telegram-bot/1.0"},
         )
-        with urlopen(request, timeout=45) as response:
+        with urlopen(request, timeout=self.http_timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
         if not payload.get("ok"):
             raise RuntimeError(f"Telegram API error: {payload}")
@@ -119,11 +120,12 @@ class TelegramBot:
 
 def main() -> None:
     load_env()
-    bot = TelegramBot(os.getenv("TELEGRAM_BOT_TOKEN", ""))
+    poll_timeout = int(os.getenv("POLL_TIMEOUT_SECONDS", "30"))
+    telegram_http_timeout = int(os.getenv("TELEGRAM_HTTP_TIMEOUT_SECONDS", str(poll_timeout + 10)))
+    bot = TelegramBot(os.getenv("TELEGRAM_BOT_TOKEN", ""), telegram_http_timeout)
     provider = build_provider()
     photo_provider = build_photo_provider()
     subscriptions = SubscriptionStore(os.getenv("SUBSCRIPTION_STORE", "subscriptions.json"))
-    poll_timeout = int(os.getenv("POLL_TIMEOUT_SECONDS", "30"))
     default_limit = int(os.getenv("DEFAULT_LIMIT", "8"))
     daily_summary_limit = int(os.getenv("DAILY_SUMMARY_LIMIT", "4"))
     daily_push_time = normalize_hhmm(os.getenv("DAILY_PUSH_TIME", "08:30"), "08:30")
